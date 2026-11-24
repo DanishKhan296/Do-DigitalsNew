@@ -2,32 +2,74 @@
 
 set -euo pipefail
 
-PROJECT_DIR="${PROJECT_DIR:-/home/z/my-project}"
-BUILD_DIR="${BUILD_DIR:?BUILD_DIR is required}"
-SOURCE_DB_DIR="$PROJECT_DIR/db"
-SOURCE_DB_PATH="$SOURCE_DB_DIR/custom.db"
-TARGET_DB_DIR="$BUILD_DIR/db"
-TARGET_DB_PATH="$TARGET_DB_DIR/custom.db"
+SCRIPT_DIR="$(cd "$(dirname "$0")/../.zscripts" && pwd)"
+TEST_ROOT="$(mktemp -d)"
+trap 'rm -rf "$TEST_ROOT"' EXIT
 
-mkdir -p "$TARGET_DB_DIR"
+FAKE_BIN="$TEST_ROOT/bin"
+mkdir -p "$FAKE_BIN"
+cat >"$FAKE_BIN/bun" <<'EOF'
+#!/bin/bash
+set -euo pipefail
 
-if [ -f "$SOURCE_DB_PATH" ]; then
-    echo "🗄️  复制 Preview 数据库到构建产物..."
-    cp -a "$SOURCE_DB_DIR/." "$TARGET_DB_DIR/"
-else
-    echo "ℹ️  未找到 Preview 数据库 db/custom.db，将初始化空的生产数据库"
-fi
-
-echo "🗄️  同步构建产物中的数据库结构..."
-(
-    cd "$PROJECT_DIR"
-    DATABASE_URL="file:$TARGET_DB_PATH" bun run db:push
-)
-
-if [ ! -f "$TARGET_DB_PATH" ]; then
-    echo "❌ 数据库初始化命令执行成功，但未生成 $TARGET_DB_PATH"
+if [ "$#" -ne 2 ] || [ "$1" != "run" ] || [ "$2" != "db:push" ]; then
+    echo "unexpected bun invocation: $*" >&2
     exit 1
 fi
 
-echo "✅ 构建产物数据库已准备完成"
-ls -lah "$TARGET_DB_DIR"
+case "${DATABASE_URL:-}" in
+    file:*) db_path="${DATABASE_URL#file:}" ;;
+    *)
+        echo "DATABASE_URL must be an absolute SQLite file URL" >&2
+        exit 1
+        ;;
+esac
+
+case "$db_path" in
+    /*) ;;
+    *)
+        echo "database path must be absolute: $db_path" >&2
+        exit 1
+        ;;
+esac
+
+mkdir -p "$(dirname "$db_path")"
+if [ ! -f "$db_path" ]; then
+    printf 'initialized\n' >"$db_path"
+fi
+printf '%s\n' "$DATABASE_URL" >>"${DB_PUSH_CALLS:?}"
+EOF
+chmod +x "$FAKE_BIN/bun"
+
+export PATH="$FAKE_BIN:$PATH"
+export DB_PUSH_CALLS="$TEST_ROOT/db-push-calls"
+
+# 没有 Preview 数据库时，应只在部署产物中初始化空库，不修改项目目录。
+EMPTY_PROJECT="$TEST_ROOT/empty-project"
+EMPTY_BUILD="$TEST_ROOT/empty-build"
+mkdir -p "$EMPTY_PROJECT"
+
+PROJECT_DIR="$EMPTY_PROJECT" BUILD_DIR="$EMPTY_BUILD" \
+    bash "$SCRIPT_DIR/database-runtime-build.sh"
+
+test -f "$EMPTY_BUILD/db/custom.db"
+test "$(cat "$EMPTY_BUILD/db/custom.db")" = "initialized"
+test ! -e "$EMPTY_PROJECT/db/custom.db"
+
+# 有 Preview 数据库时，应保留数据和同目录文件，再对产物执行 schema 同步。
+EXISTING_PROJECT="$TEST_ROOT/existing-project"
+EXISTING_BUILD="$TEST_ROOT/existing-build"
+mkdir -p "$EXISTING_PROJECT/db"
+printf 'preview-data\n' >"$EXISTING_PROJECT/db/custom.db"
+printf 'sidecar\n' >"$EXISTING_PROJECT/db/README.txt"
+
+PROJECT_DIR="$EXISTING_PROJECT" BUILD_DIR="$EXISTING_BUILD" \
+    bash "$SCRIPT_DIR/database-runtime-build.sh"
+
+test "$(cat "$EXISTING_BUILD/db/custom.db")" = "preview-data"
+test "$(cat "$EXISTING_BUILD/db/README.txt")" = "sidecar"
+test "$(wc -l <"$DB_PUSH_CALLS" | tr -d ' ')" = "2"
+grep -Fx "file:$EMPTY_BUILD/db/custom.db" "$DB_PUSH_CALLS"
+grep -Fx "file:$EXISTING_BUILD/db/custom.db" "$DB_PUSH_CALLS"
+
+echo "database runtime build tests passed"

@@ -1,0 +1,7 @@
+# DO DIGITALS — robots.txt
+User-agent: *
+Allow: /
+Disallow: /api/
+
+# Admin area is hash-based under /#/admin — not crawlable as separate URLs.
+Sitemap: https://your-domain.com/sitemap.xml
